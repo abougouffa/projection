@@ -1,6 +1,6 @@
 ;;; projection-multi-vscode-tasks.el --- Projection integration for `compile-multi' and the VScode tasks.json. -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2023  Mohsin Kaleem
+;; Copyright (C) 2023, 2026  Mohsin Kaleem
 
 ;; This program is free software: you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -37,6 +37,14 @@
           (const :tag "Cache targets and invalidate cache automatically" auto)
           (boolean :tag "Always/Never cache targets")))
 
+(defcustom projection-multi-vscode-workspace-dir nil
+  "Set the value for VSCode's ${workspaceFolder}.
+This is intented to be set in .dir-locals if needed.
+Defaults to the `project-root' if not specified."
+  :type '(choice
+          (const :tag "Unset, use project-root" nil)
+          (directory :tag "A directory for VSCode's workspaceFolder variable")))
+
 (defun projection-multi-vscode-tasks--contents ()
   "Read VSCode tasks file respecting project-cache."
   (projection--cache-get-with-predicate
@@ -64,6 +72,78 @@
     ((file-missing json-readtable-error)
      (projection--log :error "Failed to read VSCode tasks.json: %S." (cdr err)))))
 
+(defun projection-multi-vscode-tasks--workspace-dir (&optional dir)
+  (or projection-multi-vscode-workspace-dir
+      (when-let* ((prj (project-current nil dir)))
+        (project-root prj))))
+
+;; Specs at https://code.visualstudio.com/docs/reference/variables-reference
+(defun projection-multi-vscode-tasks--predefined-var (var)
+  "Return the value for VSCode's predefined variable VAR."
+  (pcase var
+    ("userHome" (expand-file-name "~"))
+    ("workspaceFolder" (projection-multi-vscode-tasks--workspace-dir))
+    ("workspaceFolderBasename" (file-name-nondirectory (directory-file-name (projection-multi-vscode-tasks--workspace-dir))))
+    ("file" (buffer-file-name))
+    ("fileBasename" (file-name-nondirectory (buffer-file-name)))
+    ("fileBasenameNoExtension" (file-name-base (buffer-file-name)))
+    ("fileExtname" (file-name-extension (buffer-file-name) t))
+    ("fileDirname" (directory-file-name (file-name-directory (buffer-file-name))))
+    ("fileDirnameBasename" (file-name-nondirectory (directory-file-name (file-name-directory (buffer-file-name)))))
+    ("lineNumber" (int-to-string (line-number-at-pos)))
+    ("columnNumber" (int-to-string (- (point) (line-beginning-position))))
+    ("selectedText" (when (region-active-p) (buffer-substring-no-properties (region-beginning) (region-end))))
+    ("execPath" (directory-file-name (file-name-directory (car command-line-args))))
+    ((or "pathSeparator" "/") (if (memq system-type '(windows-nt ms-dos)) "\\" "/"))
+    ("fileWorkspaceFolder"
+     (let ((default-directory (file-name-directory (buffer-file-name))))
+       (projection-multi-vscode-tasks--workspace-dir)))
+    ("relativeFile" (file-relative-name (buffer-file-name) (projection-multi-vscode-tasks--workspace-dir)))
+    ("relativeFileDirname" (directory-file-name (file-name-directory (file-relative-name (buffer-file-name) (projection-multi-vscode-tasks--workspace-dir)))))
+    ("cwd") ; TODO: Not clear for now!
+    ("defaultBuildTask"))) ; TODO: Not clear for now!
+
+(defun projection-multi-vscode-tasks--input-var (var)
+  "Read variable VAR from the user."
+  (let ((result))
+    (dolist (input (alist-get 'inputs (projection-multi-vscode-tasks--contents)))
+      (let-alist input
+        (when (equal .id var)
+          (let ((prompt (concat (or .description (concat "Choose an option" (when .id (concat "for " .id)))) " ")))
+            (pcase .type
+              ("pickString"
+               (setq result (completing-read prompt (mapcar (lambda (opt)
+                                                              (if (json-alist-p opt)
+                                                                  (alist-get 'value opt)
+                                                                opt))
+                                                            .options)
+                                             nil nil .default)))
+              ("promptString"
+               (setq result (if (eq .password t)
+                                (read-passwd prompt nil .default)
+                              (read-string prompt .default))))
+              ("command" (projection--log :warning "Unsupported input of type \"commands\"")))))))
+    (or result (user-error "Undefined VSCode's variable %s in tasks.json" var))))
+
+(defun projection-multi-vscode-tasks--var (name)
+  "Get the value of variable NAME."
+  (cond ((string-prefix-p "env:" name)
+         (getenv (string-remove-prefix "env:" name)))
+        ((string-prefix-p "input:" name)
+         (projection-multi-vscode-tasks--input-var (string-remove-prefix "input:" name)))
+        ((string-prefix-p "config:" name)
+         (projection--log :warning "Variable of type config are not supported"))
+        (t (projection-multi-vscode-tasks--predefined-var name))))
+
+(defun projection-multi-vscode-tasks--substitute-vars (str)
+  "Substitute variables in STR."
+  (let ((start -1) var-names)
+    (while (setq start (string-match "\\${\\([^}]*\\)}" str (1+ start)))
+      (push (match-string 1 str) var-names))
+    (dolist (var-name (cl-remove-duplicates (reverse var-names)))
+      (setq str (string-replace (format "${%s}" var-name) (projection-multi-vscode-tasks--var var-name) str)))
+    str))
+
 
 
 ;;;###autoload
@@ -85,17 +165,21 @@ When set the generated targets will be prefixed with PROJECT-TYPE."
                               (when .group
                                 (concat .group ":"))
                               (or .label .command))
-                      (projection--join-shell-command
-                       `(,@(projection--env-shell-command-prefix
-                            (cl-loop for (key . value) in (alist-get 'env .options)
-                                     collect (cons (symbol-name key) value))
-                            (alist-get 'cwd .options))
-                         ,.command
-                         ,@(cl-loop for arg in .args
-                                    when (consp arg)
-                                      collect (alist-get 'value arg)
-                                    else
-                                      collect arg))))
+                      (lambda ()
+                        (concat
+                         (projection--join-shell-command
+                          (projection--env-shell-command-prefix
+                           (cl-loop for (key . value) in (alist-get 'env .options)
+                                    collect (cons (symbol-name key) (projection-multi-vscode-tasks--substitute-vars value)))
+                           (alist-get 'cwd .options)))
+                         (let ((cmd (projection-multi-vscode-tasks--substitute-vars .command)))
+                           (if (eq .type 'shell) cmd (shell-quote-argument cmd)))
+                         (projection--join-shell-command
+                          (cl-loop for arg in .args
+                                   when (consp arg)
+                                   collect (projection-multi-vscode-tasks--substitute-vars (alist-get 'value arg))
+                                   else
+                                   collect (projection-multi-vscode-tasks--substitute-vars arg))))))
                 result))))
     (nreverse result)))
 
